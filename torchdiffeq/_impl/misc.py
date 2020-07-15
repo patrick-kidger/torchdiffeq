@@ -1,5 +1,6 @@
 import warnings
 import torch
+import torch.nn as nn
 
 
 def _flatten(sequence):
@@ -205,14 +206,14 @@ def _check_func_type(func, adjoint):
     if adjoint:
         # We need this in order to access the variables inside this module,
         # since we have no other way of getting variables along the execution path.
-        if not isinstance(func, torch.nn.Module):
+        if not isinstance(func, nn.Module):
             raise ValueError('func is required to be an instance of nn.Module.')
     else:
         if not callable(func):
             raise ValueError('func is required to be callable.')
 
 
-class _TupleFunc(torch.nn.Module):
+class _TupleFunc(nn.Module):
 
     def __init__(self, base_func):
         super(_TupleFunc, self).__init__()
@@ -222,7 +223,7 @@ class _TupleFunc(torch.nn.Module):
         return (self.base_func(t, y[0]),)
 
 
-class _ReverseFunc(torch.nn.Module):
+class _ReverseFunc(nn.Module):
 
     def __init__(self, base_func):
         super(_ReverseFunc, self).__init__()

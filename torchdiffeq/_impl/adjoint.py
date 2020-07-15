@@ -1,10 +1,43 @@
+import itertools
 import torch
 import torch.nn as nn
 from .odeint import odeint
 from .misc import _flatten, _flatten_convert_none_to_zeros, _check_inputs
 
 
-class OdeintAdjointMethod(torch.autograd.Function):
+class _AugmentedDynamics(nn.Module):
+    def __init__(self, func, n_tensors):
+        self.func = func
+        self.n_tensors = n_tensors
+        self.f_params = tuple(func.parameters())
+
+    def forward(self, t, y_aug):
+        # Dynamics of the original system augmented with
+        # the adjoint wrt y, and an integrator wrt t and args.
+        y, adj_y = y_aug[:self.n_tensors], y_aug[self.n_tensors:2 * self.n_tensors]  # Ignore adj_time and adj_params.
+
+        with torch.set_grad_enabled(True):
+            t = t.to(y[0].device).detach().requires_grad_(True)
+            y = tuple(y_.detach().requires_grad_(True) for y_ in y)
+            func_eval = self.func(t, y)
+            vjp_t, *vjp_y_and_params = torch.autograd.grad(
+                func_eval, (t,) + y + self.f_params,
+                tuple(-adj_y_ for adj_y_ in adj_y), allow_unused=True, retain_graph=True
+            )
+        vjp_y = vjp_y_and_params[:self.n_tensors]
+        vjp_params = vjp_y_and_params[self.n_tensors:]
+
+        # autograd.grad returns None if no gradient, set to zero.
+        vjp_t = torch.zeros_like(t) if vjp_t is None else vjp_t
+        vjp_y = tuple(torch.zeros_like(y_) if vjp_y_ is None else vjp_y_ for vjp_y_, y_ in zip(vjp_y, y))
+        vjp_params = _flatten_convert_none_to_zeros(vjp_params, self.f_params)
+
+        if len(self.f_params) == 0:
+            vjp_params = torch.tensor(0.).to(vjp_y[0])
+        return (*func_eval, *vjp_y, vjp_t, vjp_params)
+
+
+class _OdeintAdjointMethod(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, func, t, flat_params, rtol, atol, method, options, adjoint_rtol, adjoint_atol, adjoint_method,
@@ -24,38 +57,17 @@ class OdeintAdjointMethod(torch.autograd.Function):
     def backward(ctx, *grad_output):
         t, flat_params, *ans = ctx.saved_tensors
         n_tensors = len(ans)
-        f_params = tuple(ctx.func.parameters())
 
-        # TODO: use a nn.Module and call odeint_adjoint to implement higher order derivatives.
-        def augmented_dynamics(t, y_aug):
-            # Dynamics of the original system augmented with
-            # the adjoint wrt y, and an integrator wrt t and args.
-            y, adj_y = y_aug[:n_tensors], y_aug[n_tensors:2 * n_tensors]  # Ignore adj_time and adj_params.
+        # TODO: call odeint_adjoint to implement higher order derivatives.
 
-            with torch.set_grad_enabled(True):
-                t = t.to(y[0].device).detach().requires_grad_(True)
-                y = tuple(y_.detach().requires_grad_(True) for y_ in y)
-                func_eval = ctx.func(t, y)
-                vjp_t, *vjp_y_and_params = torch.autograd.grad(
-                    func_eval, (t,) + y + f_params,
-                    tuple(-adj_y_ for adj_y_ in adj_y), allow_unused=True, retain_graph=True
-                )
-            vjp_y = vjp_y_and_params[:n_tensors]
-            vjp_params = vjp_y_and_params[n_tensors:]
-
-            # autograd.grad returns None if no gradient, set to zero.
-            vjp_t = torch.zeros_like(t) if vjp_t is None else vjp_t
-            vjp_y = tuple(torch.zeros_like(y_) if vjp_y_ is None else vjp_y_ for vjp_y_, y_ in zip(vjp_y, y))
-            vjp_params = _flatten_convert_none_to_zeros(vjp_params, f_params)
-
-            if len(f_params) == 0:
-                vjp_params = torch.tensor(0.).to(vjp_y[0])
-            return (*func_eval, *vjp_y, vjp_t, vjp_params)
+        augmented_dynamics = []
+        for t0, t1, func_ in ctx.func:
+            augmented_dynamics.append([t1, t0, _AugmentedDynamics(func_, n_tensors)])
 
         T = ans[0].shape[0]
         with torch.no_grad():
             adj_y = tuple(grad_output_[-1] for grad_output_ in grad_output)
-            adj_params = torch.zeros_like(flat_params)
+            adj_params = torch.zeros_like(flat_params)  # TODO: figure out
             adj_time = torch.tensor(0.).to(t)
             time_vjps = []
             for i in range(T - 1, 0, -1):
@@ -64,6 +76,7 @@ class OdeintAdjointMethod(torch.autograd.Function):
                 grad_output_i = tuple(grad_output_[i] for grad_output_ in grad_output)
                 func_i = ctx.func(t[i], ans_i)
 
+                # TODO: figure out
                 # Compute the effect of moving the current time measurement point.
                 dLd_cur_t = sum(
                     torch.dot(func_i_.reshape(-1), grad_output_i_.reshape(-1)).reshape(1)
@@ -119,9 +132,9 @@ def odeint_adjoint(func, y0, t, rtol=1e-6, atol=1e-12, method=None, options=None
     if adjoint_options is None:
         adjoint_options = options
 
-    flat_params = _flatten(func.parameters())
-    ys = OdeintAdjointMethod.apply(func, t, flat_params, rtol, atol, method, options, adjoint_rtol, adjoint_atol,
-                                   adjoint_method, adjoint_options, *y0)
+    flat_params = _flatten(itertools.chain(func_.parameters() for _, _, func_ in func))
+    ys = _OdeintAdjointMethod.apply(func, t, flat_params, rtol, atol, method, options, adjoint_rtol, adjoint_atol,
+                                    adjoint_method, adjoint_options, *y0)
 
     if tensor_input:
         ys = ys[0]
