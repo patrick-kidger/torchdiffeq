@@ -1,6 +1,6 @@
 import abc
 import torch
-from .misc import _assert_increasing, _handle_unused_kwargs
+from .misc import _handle_unused_kwargs
 
 
 class AdaptiveStepsizeODESolver(object):
@@ -23,14 +23,13 @@ class AdaptiveStepsizeODESolver(object):
         raise NotImplementedError
 
     def integrate(self, t):
-        _assert_increasing(t)
-        solution = [self.y0]
+        solution = []
         t = t.to(self.y0[0].device, torch.float64)
         self.before_integrate(t)
         for i in range(1, len(t)):
             y = self.advance(t[i])
             solution.append(y)
-        return tuple(map(torch.stack, tuple(zip(*solution))))
+        return solution
 
 
 class FixedGridODESolver(object):
@@ -82,13 +81,12 @@ class FixedGridODESolver(object):
         pass
 
     def integrate(self, t):
-        _assert_increasing(t)
         t = t.type_as(self.y0[0])
         time_grid = self.grid_constructor(self.func, self.y0, t)
         assert time_grid[0] == t[0] and time_grid[-1] == t[-1]
         time_grid = time_grid.to(self.y0[0])
 
-        solution = [self.y0]
+        solution = []
 
         j = 1
         y0 = self.y0
@@ -101,7 +99,7 @@ class FixedGridODESolver(object):
                 j += 1
             y0 = y1
 
-        return tuple(map(torch.stack, tuple(zip(*solution))))
+        return solution
 
     def _linear_interp(self, t0, t1, y0, y1, t):
         if t == t0:

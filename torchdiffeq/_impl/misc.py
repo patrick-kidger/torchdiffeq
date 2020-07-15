@@ -56,8 +56,22 @@ def _decreasing(t):
     return (t[1:] < t[:-1]).all()
 
 
-def _assert_increasing(t):
-    assert (t[1:] > t[:-1]).all(), 't must be strictly increasing or decreasing'
+def _assert_monotone(t):
+    direction = t[1:] > t[:-1]
+    assert direction.all() or (~direction).all(), '`t` must be strictly increasing or decreasing'
+
+
+def _assert_one_dimensional(tensor_name, tensor):
+    assert len(tensor.shape) == 1, "`{}` must be one dimensional but has shape {}".format(tensor_name, tensor.shape)
+
+
+def _assert_zero_dimensional(tensor_name, tensor):
+    assert len(tensor.shape) == 0, "`{}` must be zero dimensional but has shape {}".format(tensor_name, tensor.shape)
+
+
+def _check_floating_point(tensor_name, tensor):
+    if not torch.is_floating_point(tensor):
+        raise TypeError('`{}` must be a floating point Tensor but is a {}'.format(tensor_name, tensor.type()))
 
 
 def _is_iterable(inputs):
@@ -170,26 +184,70 @@ def _optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0, df
     return last_step / factor
 
 
+def _check_t(t):
+    _assert_monotone(t)
+    _assert_one_dimensional('t', t)
+    assert len(t) >= 1, "`t` must be of length at least one."
+
+
 def _check_inputs(func, y0, t):
+    # Normalise func to being a list
+    if callable(func):
+        func = [[t[0], t[-1], func]]
+    assert isinstance(func, (tuple, list)), ("func must either be (A) a callable, or (B) a tuple or list of 3-tuples, "
+                                             "with the first two elements specifying a region of integration, and the "
+                                             "third element being a callable to use on that region.")
+    func = list(func)  # make a copy if it's a list; convert to list if it's a tuple
+
+    # Check that func is a list of 3-tuples or 3-element lists and normalise the region of integration to be tensors
+    for i, func_ in enumerate(func):
+        assert len(func_) == 3, "each element of func should be a 3-tuple of start point, end point, and callable"
+        t0, t1, func_ = func_
+        t0 = _convert_to_tensor(t0)
+        t1 = _convert_to_tensor(t1)
+        _assert_zero_dimensional('the first element of a tuple in func, representing the start point', t0)
+        _assert_zero_dimensional('the second element of a tuple in func, representing the end point', t1)
+        _check_floating_point('t0', t0)
+        _check_floating_point('t1', t1)
+        assert callable(func_), "the third element of func must be a callable"
+        func[i] = [t0, t1, func_]  # convert to list; t0 and t1 are converted to tensors
+
+    # Normalise to tupled inputs
     tensor_input = False
     if torch.is_tensor(y0):
         tensor_input = True
         y0 = (y0,)
-        _base_nontuple_func_ = func
-        func = lambda t, y: (_base_nontuple_func_(t, y[0]),)
+        for func_list in func:
+            _, _, func_ = func_list
+            func_ = lambda t, y, _base_func=func_: (_base_func(t, y[0]),)
+            func_list[2] = func_
     assert isinstance(y0, tuple), 'y0 must be either a torch.Tensor or a tuple'
     for y0_ in y0:
         assert torch.is_tensor(y0_), 'each element must be a torch.Tensor but received {}'.format(type(y0_))
 
+    # Normalise to increasing t
     if _decreasing(t):
         t = -t
-        _base_reverse_func = func
-        func = lambda t, y: tuple(-f_ for f_ in _base_reverse_func(-t, y))
+        for func_list in func:
+            t0, t1, func_ = func_list
+            func_ = lambda t, y, _base_func=func_: tuple(-f_ for f_ in _base_func(-t, y))
+            func_list[0] = -t0
+            func_list[1] = -t1
+            func_list[2] = func_
+        func = list(reversed(func))
 
+    # Check regions of integration
+    assert func[0][0] == t[0], "the first region of integration must begin at t[0]"
+    assert func[-1][1] == t[-1], "the last region of integration must end at t[-1]"
+    prev_t1 = t[0]
+    for t0, t1, func_ in func:
+        assert prev_t1 == t0, "the regions of integration must cover the whole interval"
+        assert t0 < t1, "regions of integration must be monotone and of positive size"
+        prev_t1 = t1
+
+    # Check dtypes
     for y0_ in y0:
-        if not torch.is_floating_point(y0_):
-            raise TypeError('`y0` must be a floating point Tensor but is a {}'.format(y0_.type()))
-    if not torch.is_floating_point(t):
-        raise TypeError('`t` must be a floating point Tensor but is a {}'.format(t.type()))
+        _check_floating_point('y0', y0_)
+    _check_floating_point('t', t)
 
     return tensor_input, func, y0, t

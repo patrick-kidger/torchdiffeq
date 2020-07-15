@@ -1,3 +1,4 @@
+import torch
 from .tsit5 import Tsit5Solver
 from .dopri5 import Dopri5Solver
 from .bosh3 import Bosh3Solver
@@ -6,7 +7,7 @@ from .fixed_grid import Euler, Midpoint, RK4
 from .fixed_adams import AdamsBashforth, AdamsBashforthMoulton
 from .adams import VariableCoefficientAdamsBashforth
 from .dopri8 import Dopri8Solver
-from .misc import _check_inputs
+from .misc import _check_t, _check_inputs
 
 SOLVERS = {
     'explicit_adams': AdamsBashforth,
@@ -60,7 +61,9 @@ def odeint(func, y0, t, rtol=1e-7, atol=1e-9, method=None, options=None):
     Raises:
         ValueError: if an invalid `method` is provided.
     """
-
+    _check_t(t)
+    if len(t) == 1:
+        return y0.clone().unsqueeze(0)
     tensor_input, func, y0, t = _check_inputs(func, y0, t)
 
     if options is None:
@@ -75,9 +78,31 @@ def odeint(func, y0, t, rtol=1e-7, atol=1e-9, method=None, options=None):
         raise ValueError('Invalid method "{}". Must be one of {}'.format(
                          method, '{"' + '", "'.join(SOLVERS.keys()) + '"}.'))
 
-    solver = SOLVERS[method](func, y0, rtol=rtol, atol=atol, **options)
-    solution = solver.integrate(t)
+    solution = [y0]
+    t_index = 0
+    for t0, t1, func_ in func:
+        prev_t_index = t_index
+        while t[t_index] < t1:
+            t_index += 1
+        # loop invariant: t[prev_t_index - 1] < t0 <= t[prev_t_index]
+        # loop invariant: t[t_index - 1] < t1 <= t[t_index]
+        # loop invariant: prev_t_index <= t_index
 
+        y0 = solution[-1]
+
+        t_ = []
+        if t0 != t[prev_t_index]:
+            solution.pop()
+            t_.append(t0.unsqueeze(0))
+        t_.append(t[prev_t_index:t_index])
+        t_.append(t1.unsqueeze(0))
+        t_ = torch.cat(t_)
+
+        solver = SOLVERS[method](func_, y0, rtol=rtol, atol=atol, **options)
+        solution_ = solver.integrate(t_)
+        solution.extend(solution_)
+
+    solution = tuple(map(torch.stack, tuple(zip(*solution))))
     if tensor_input:
         solution = solution[0]
     return solution
