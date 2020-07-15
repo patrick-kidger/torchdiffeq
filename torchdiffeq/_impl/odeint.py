@@ -7,7 +7,7 @@ from .fixed_grid import Euler, Midpoint, RK4
 from .fixed_adams import AdamsBashforth, AdamsBashforthMoulton
 from .adams import VariableCoefficientAdamsBashforth
 from .dopri8 import Dopri8Solver
-from .misc import _check_t, _check_inputs
+from .misc import _check_inputs
 
 SOLVERS = {
     'explicit_adams': AdamsBashforth,
@@ -61,10 +61,9 @@ def odeint(func, y0, t, rtol=1e-7, atol=1e-9, method=None, options=None):
     Raises:
         ValueError: if an invalid `method` is provided.
     """
-    _check_t(t)
-    if len(t) == 1:
-        return y0.clone().unsqueeze(0)
-    tensor_input, func, y0, t = _check_inputs(func, y0, t)
+    tensor_input, func, y0, t, solution = _check_inputs(func, y0, t, adjoint=False)
+    if solution is not None:
+        return solution
 
     if options is None:
         options = {}

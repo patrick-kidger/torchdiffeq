@@ -1,20 +1,19 @@
 import torch
 import torch.nn as nn
-from . import odeint
-from .misc import _flatten, _flatten_convert_none_to_zeros
+from .odeint import odeint
+from .misc import _flatten, _flatten_convert_none_to_zeros, _check_inputs
 
 
 class OdeintAdjointMethod(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, *args):
-        assert len(args) >= 8, 'Internal error: all arguments required.'
-        (y0, func, t, flat_params, rtol, atol, method, options, adjoint_rtol, adjoint_atol, adjoint_method,
-         adjoint_options) = (args[:-11], args[-11], args[-10], args[-9], args[-8], args[-7], args[-6], args[-5],
-                             args[-4], args[-3], args[-2], args[-1])
-
-        (ctx.func, ctx.adjoint_rtol, ctx.adjoint_atol, ctx.adjoint_method,
-         ctx.adjoint_options) = func, adjoint_rtol, adjoint_atol, adjoint_method, adjoint_options
+    def forward(ctx, func, t, flat_params, rtol, atol, method, options, adjoint_rtol, adjoint_atol, adjoint_method,
+                adjoint_options, *y0):
+        ctx.func = func
+        ctx.adjoint_rtol = adjoint_rtol
+        ctx.adjoint_atol = adjoint_atol
+        ctx.adjoint_method = adjoint_method
+        ctx.adjoint_options = adjoint_options
 
         with torch.no_grad():
             ans = odeint(func, y0, t, rtol=rtol, atol=atol, method=method, options=options)
@@ -24,11 +23,8 @@ class OdeintAdjointMethod(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_output):
         t, flat_params, *ans = ctx.saved_tensors
-        ans = tuple(ans)
-        (func, adjoint_rtol, adjoint_atol, adjoint_method,
-         adjoint_options) = ctx.func, ctx.adjoint_rtol, ctx.adjoint_atol, ctx.adjoint_method, ctx.adjoint_options
         n_tensors = len(ans)
-        f_params = tuple(func.parameters())
+        f_params = tuple(ctx.func.parameters())
 
         # TODO: use a nn.Module and call odeint_adjoint to implement higher order derivatives.
         def augmented_dynamics(t, y_aug):
@@ -39,7 +35,7 @@ class OdeintAdjointMethod(torch.autograd.Function):
             with torch.set_grad_enabled(True):
                 t = t.to(y[0].device).detach().requires_grad_(True)
                 y = tuple(y_.detach().requires_grad_(True) for y_ in y)
-                func_eval = func(t, y)
+                func_eval = ctx.func(t, y)
                 vjp_t, *vjp_y_and_params = torch.autograd.grad(
                     func_eval, (t,) + y + f_params,
                     tuple(-adj_y_ for adj_y_ in adj_y), allow_unused=True, retain_graph=True
@@ -66,7 +62,7 @@ class OdeintAdjointMethod(torch.autograd.Function):
 
                 ans_i = tuple(ans_[i] for ans_ in ans)
                 grad_output_i = tuple(grad_output_[i] for grad_output_ in grad_output)
-                func_i = func(t[i], ans_i)
+                func_i = ctx.func(t[i], ans_i)
 
                 # Compute the effect of moving the current time measurement point.
                 dLd_cur_t = sum(
@@ -83,7 +79,8 @@ class OdeintAdjointMethod(torch.autograd.Function):
                 aug_ans = odeint(
                     augmented_dynamics, aug_y0,
                     torch.tensor([t[i], t[i - 1]]),
-                    rtol=adjoint_rtol, atol=adjoint_atol, method=adjoint_method, options=adjoint_options
+                    rtol=ctx.adjoint_rtol, atol=ctx.adjoint_atol, method=ctx.adjoint_method,
+                    options=ctx.adjoint_options
                 )
 
                 # Unpack aug_ans.
@@ -92,8 +89,10 @@ class OdeintAdjointMethod(torch.autograd.Function):
                 adj_params = aug_ans[2 * n_tensors + 1]
 
                 adj_y = tuple(adj_y_[1] if len(adj_y_) > 0 else adj_y_ for adj_y_ in adj_y)
-                if len(adj_time) > 0: adj_time = adj_time[1]
-                if len(adj_params) > 0: adj_params = adj_params[1]
+                if len(adj_time) > 0:
+                    adj_time = adj_time[1]
+                if len(adj_params) > 0:
+                    adj_params = adj_params[1]
 
                 adj_y = tuple(adj_y_ + grad_output_[i - 1] for adj_y_, grad_output_ in zip(adj_y, grad_output))
 
@@ -102,16 +101,14 @@ class OdeintAdjointMethod(torch.autograd.Function):
             time_vjps.append(adj_time)
             time_vjps = torch.cat(time_vjps[::-1])
 
-            return (*adj_y, None, time_vjps, adj_params, None, None, None, None, None, None, None, None)
+            return (None, time_vjps, adj_params, None, None, None, None, None, None, None, None, *adj_y)
 
 
 def odeint_adjoint(func, y0, t, rtol=1e-6, atol=1e-12, method=None, options=None, adjoint_rtol=None, adjoint_atol=None,
                    adjoint_method=None, adjoint_options=None):
-
-    # We need this in order to access the variables inside this module,
-    # since we have no other way of getting variables along the execution path.
-    if not isinstance(func, nn.Module):
-        raise ValueError('func is required to be an instance of nn.Module.')
+    tensor_input, func, y0, t, solution = _check_inputs(func, y0, t, adjoint=True)
+    if solution is not None:
+        return solution
 
     if adjoint_rtol is None:
         adjoint_rtol = rtol
@@ -122,25 +119,9 @@ def odeint_adjoint(func, y0, t, rtol=1e-6, atol=1e-12, method=None, options=None
     if adjoint_options is None:
         adjoint_options = options
 
-    tensor_input = False
-    if torch.is_tensor(y0):
-
-        class TupleFunc(nn.Module):
-
-            def __init__(self, base_func):
-                super(TupleFunc, self).__init__()
-                self.base_func = base_func
-
-            def forward(self, t, y):
-                return (self.base_func(t, y[0]),)
-
-        tensor_input = True
-        y0 = (y0,)
-        func = TupleFunc(func)
-
     flat_params = _flatten(func.parameters())
-    ys = OdeintAdjointMethod.apply(*y0, func, t, flat_params, rtol, atol, method, options, adjoint_rtol, adjoint_atol,
-                                   adjoint_method, adjoint_options)
+    ys = OdeintAdjointMethod.apply(func, t, flat_params, rtol, atol, method, options, adjoint_rtol, adjoint_atol,
+                                   adjoint_method, adjoint_options, *y0)
 
     if tensor_input:
         ys = ys[0]

@@ -52,28 +52,6 @@ def _is_finite(tensor):
     return not _check.any()
 
 
-def _decreasing(t):
-    return (t[1:] < t[:-1]).all()
-
-
-def _assert_monotone(t):
-    direction = t[1:] > t[:-1]
-    assert direction.all() or (~direction).all(), '`t` must be strictly increasing or decreasing'
-
-
-def _assert_one_dimensional(tensor_name, tensor):
-    assert len(tensor.shape) == 1, "`{}` must be one dimensional but has shape {}".format(tensor_name, tensor.shape)
-
-
-def _assert_zero_dimensional(tensor_name, tensor):
-    assert len(tensor.shape) == 0, "`{}` must be zero dimensional but has shape {}".format(tensor_name, tensor.shape)
-
-
-def _check_floating_point(tensor_name, tensor):
-    if not torch.is_floating_point(tensor):
-        raise TypeError('`{}` must be a floating point Tensor but is a {}'.format(tensor_name, tensor.type()))
-
-
 def _is_iterable(inputs):
     try:
         iter(inputs)
@@ -184,13 +162,81 @@ def _optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0, df
     return last_step / factor
 
 
-def _check_t(t):
+def _clone_contiguous(x):
+    # Creates a contiguous copy
+
+    # We can't do just .clone() because that changed with PyTorch 1.5.
+    # Before then it created a contiguous copy. After that it creates a same-strides-as-before copy.
+
+    # We can't do just .contiguous() because that won't create a copy if we're already contiguous.
+
+    # We don't want to do .contiguous().clone() or .clone().contiguous() because that may create two copies, depending
+    # on PyTorch version, which is wasteful.
+
+    if x.is_contiguous():
+        return x.clone()
+    else:
+        return x.contiguous()
+
+
+def _decreasing(t):
+    return (t[1:] < t[:-1]).all()
+
+
+def _assert_monotone(t):
+    direction = t[1:] > t[:-1]
+    assert direction.all() or (~direction).all(), '`t` must be strictly increasing or decreasing'
+
+
+def _assert_one_dimensional(tensor_name, tensor):
+    assert len(tensor.shape) == 1, "`{}` must be one dimensional but has shape {}".format(tensor_name, tensor.shape)
+
+
+def _assert_zero_dimensional(tensor_name, tensor):
+    assert len(tensor.shape) == 0, "`{}` must be zero dimensional but has shape {}".format(tensor_name, tensor.shape)
+
+
+def _check_floating_point(tensor_name, tensor):
+    if not torch.is_floating_point(tensor):
+        raise TypeError('`{}` must be a floating point Tensor but is a {}'.format(tensor_name, tensor.type()))
+
+
+def _check_func_type(func, adjoint):
+    if adjoint:
+        # We need this in order to access the variables inside this module,
+        # since we have no other way of getting variables along the execution path.
+        if not isinstance(func, torch.nn.Module):
+            raise ValueError('func is required to be an instance of nn.Module.')
+    else:
+        if not callable(func):
+            raise ValueError('func is required to be callable.')
+
+
+class _TupleFunc(torch.nn.Module):
+
+    def __init__(self, base_func):
+        super(_TupleFunc, self).__init__()
+        self.base_func = base_func
+
+    def forward(self, t, y):
+        return (self.base_func(t, y[0]),)
+
+
+class _ReverseFunc(torch.nn.Module):
+
+    def __init__(self, base_func):
+        super(_ReverseFunc, self).__init__()
+        self.base_func = base_func
+
+    def forward(self, t, y):
+        return tuple(-f_ for f_ in self.base_func(-t, y))
+
+
+def _check_inputs(func, y0, t, adjoint):
     _assert_monotone(t)
     _assert_one_dimensional('t', t)
-    assert len(t) >= 1, "`t` must be of length at least one."
+    assert len(t) >= 1, "`t` must be of length at least one."  # no length-zero tensors
 
-
-def _check_inputs(func, y0, t):
     # Normalise func to being a list
     if callable(func):
         func = [[t[0], t[-1], func]]
@@ -209,7 +255,7 @@ def _check_inputs(func, y0, t):
         _assert_zero_dimensional('the second element of a tuple in func, representing the end point', t1)
         _check_floating_point('t0', t0)
         _check_floating_point('t1', t1)
-        assert callable(func_), "the third element of func must be a callable"
+        _check_func_type(func_, adjoint)
         func[i] = [t0, t1, func_]  # convert to list; t0 and t1 are converted to tensors
 
     # Normalise to tupled inputs
@@ -219,8 +265,7 @@ def _check_inputs(func, y0, t):
         y0 = (y0,)
         for func_list in func:
             _, _, func_ = func_list
-            func_ = lambda t, y, _base_func=func_: (_base_func(t, y[0]),)
-            func_list[2] = func_
+            func_list[2] = _TupleFunc(func_)
     assert isinstance(y0, tuple), 'y0 must be either a torch.Tensor or a tuple'
     for y0_ in y0:
         assert torch.is_tensor(y0_), 'each element must be a torch.Tensor but received {}'.format(type(y0_))
@@ -230,10 +275,9 @@ def _check_inputs(func, y0, t):
         t = -t
         for func_list in func:
             t0, t1, func_ = func_list
-            func_ = lambda t, y, _base_func=func_: tuple(-f_ for f_ in _base_func(-t, y))
             func_list[0] = -t0
             func_list[1] = -t1
-            func_list[2] = func_
+            func_list[2] = _ReverseFunc(func_)
         func = list(reversed(func))
 
     # Check regions of integration
@@ -242,7 +286,8 @@ def _check_inputs(func, y0, t):
     prev_t1 = t[0]
     for t0, t1, func_ in func:
         assert prev_t1 == t0, "the regions of integration must cover the whole interval"
-        assert t0 < t1, "regions of integration must be monotone and of positive size"
+        if len(t) > 1:  # when len(t) == 1 then t0 == t1 and that's okay
+            assert t0 < t1, "regions of integration must be monotone and of positive size"
         prev_t1 = t1
 
     # Check dtypes
@@ -250,4 +295,11 @@ def _check_inputs(func, y0, t):
         _check_floating_point('y0', y0_)
     _check_floating_point('t', t)
 
-    return tensor_input, func, y0, t
+    if len(t) == 1:
+        solution = tuple(_clone_contiguous(y0_).unsqueeze(0) for y0_ in y0)
+        if tensor_input:
+            solution = solution[0]
+    else:
+        solution = None
+
+    return tensor_input, func, y0, t, solution
