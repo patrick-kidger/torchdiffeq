@@ -38,7 +38,9 @@ def odeint(func, y0, t, rtol=1e-7, atol=1e-9, method=None, options=None):
     Args:
         func: Function that maps a scalar Tensor `t` and a Tensor holding the state `y`
             into a Tensor of state derivatives with respect to time. Optionally, `y`
-            can also be a tuple of Tensors.
+            can also be a tuple of Tensors. Optionally, `func` can be tuple of 3-tuples,
+            to specify different behaviour in different regions of integration. See the
+            note below.
         y0: N-D Tensor giving starting value of `y` at time point `t[0]`. Optionally, `y0`
             can also be a tuple of Tensors.
         t: 1-D Tensor holding a sequence of time points for which to solve for
@@ -58,8 +60,38 @@ def odeint(func, y0, t, rtol=1e-7, atol=1e-9, method=None, options=None):
             `t`, with the initial value `y0` being the first element along the first
             dimension.
 
+    Note:
+        `func` can also be a tuple of 3-tuples; the first and second elements of each 3-tuple define a region of
+        integration whilst the third is a callable that defines the vector field on that region. This allows for
+        accurately solving vector fields that are piecewise in time. (Note that simply checking the input time inside
+        the `forward` method of a single vector field may not be as accurate, as solvers may overshoot, and also do not
+        allow for discontinuous jumps.)
+
+        Example:
+            ```
+            odeint(func=func, t=t, ...)
+            ```
+            is equivalent to
+            ```
+            func = ((t[0], t[-1], func),)
+            odeint(func=func, t=t, ...)
+            ```
+
+        Example:
+            ```
+            func = ((t0, t1, func1),  # use func1 on the interval (t0, t1)
+                    (t1, t2, func2),  # use func2 on the interval (t1, t2)
+                    (t2, t3, func3)   # use func3 on the interval (t2, t3)
+            odeint(func=func, t=torch.tensor([t0, t3]), ...)
+            ```
+
+        The specified regions of integration for each vector field must line up, and completely cover integration
+        times specified by `t`.
+
     Raises:
-        ValueError: if an invalid `method` is provided.
+        ValueError: if an invalid `method` is provided or if an invalid `func` is provided.
+        TypeError: if the passed tensors are not floating point.
+        AssertionError: for invalid arguments or for errors during the integration.
     """
     tensor_input, func, y0, t, solution = _check_inputs(func, y0, t, adjoint=False)
     if solution is not None:

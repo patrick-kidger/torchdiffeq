@@ -3,19 +3,6 @@ import torch
 import torch.nn as nn
 
 
-def _flatten(sequence):
-    flat = [p.contiguous().view(-1) for p in sequence]
-    return torch.cat(flat) if len(flat) > 0 else torch.tensor([])
-
-
-def _flatten_convert_none_to_zeros(sequence, like_sequence):
-    flat = [
-        p.contiguous().view(-1) if p is not None else torch.zeros_like(q).view(-1)
-        for p, q in zip(sequence, like_sequence)
-    ]
-    return torch.cat(flat) if len(flat) > 0 else torch.tensor([])
-
-
 def _possibly_nonzero(x):
     return isinstance(x, torch.Tensor) or x != 0
 
@@ -39,18 +26,11 @@ def _has_converged(y0, y1, rtol, atol):
 
 
 def _convert_to_tensor(a, dtype=None, device=None):
-    if not isinstance(a, torch.Tensor):
-        a = torch.tensor(a)
-    if dtype is not None:
-        a = a.type(dtype)
-    if device is not None:
-        a = a.to(device)
-    return a
+    return torch.as_tensor(a, dtype=dtype, device=device)
 
 
 def _is_finite(tensor):
-    _check = (tensor == float('inf')) + (tensor == float('-inf')) + torch.isnan(tensor)
-    return not _check.any()
+    return torch.isfinite(tensor).any()
 
 
 def _is_iterable(inputs):
@@ -166,8 +146,8 @@ def _optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0, df
 def _clone_contiguous(x):
     # Creates a contiguous copy
 
-    # We can't do just .clone() because that changed with PyTorch 1.5.
-    # Before then it created a contiguous copy. After that it creates a same-strides-as-before copy.
+    # We can't do just .clone() because that won't necessarily be contiguous PyTorch >=1.5.
+    # (Before then it created a contiguous copy. After that it creates a same-strides-as-before copy.)
 
     # We can't do just .contiguous() because that won't create a copy if we're already contiguous.
 
@@ -234,26 +214,44 @@ class _ReverseFunc(nn.Module):
 
 
 def _check_inputs(func, y0, t, adjoint):
+    # Check t
+    assert torch.is_tensor(t), "`t` must be a torch.Tensor."
     _assert_monotone(t)
     _assert_one_dimensional('t', t)
+    _check_floating_point('t', t)
     assert len(t) >= 1, "`t` must be of length at least one."  # no length-zero tensors
 
-    # Normalise func to being a list
+    # Check type of y0
+    if isinstance(y0, tuple):
+        assert len(y0) > 0, "`y0` must be a tuple of length at least one."
+        for y0_ in y0:
+            assert torch.is_tensor(y0_), 'each element of `y0` must be a torch.Tensor but received {}'.format(type(y0_))
+            _check_floating_point('y0', y0_)
+    else:
+        assert torch.is_tensor(y0), 'y0 must be either a torch.Tensor or a tuple'
+        _check_floating_point('y0', y0)
+
+    # Normalise device
+    t = t.to(y0.device if torch.is_tensor(y0) else y0[0].device)
+
+    # Normalise func if it's passed as a callable
     if callable(func):
         func = [[t[0], t[-1], func]]
     assert isinstance(func, (tuple, list)), ("func must either be (A) a callable, or (B) a tuple or list of 3-tuples, "
                                              "with the first two elements specifying a region of integration, and the "
                                              "third element being a callable to use on that region.")
-    func = list(func)  # make a copy if it's a list; convert to list if it's a tuple
+    assert len(func) > 0, "cannot pass an empty list/tuple as `func`"
+    func = [list(func_) for func_ in func]  # make a copy if it's a list; convert to list if it's a tuple
 
-    # Check that func is a list of 3-tuples or 3-element lists and normalise the region of integration to be tensors
+    # Check that elements of func are either 3-tuples or 3-element lists, and normalise the region of integration to be
+    # tensors
     for i, func_ in enumerate(func):
         assert len(func_) == 3, "each element of func should be a 3-tuple of start point, end point, and callable"
         t0, t1, func_ = func_
-        t0 = _convert_to_tensor(t0)
-        t1 = _convert_to_tensor(t1)
-        _assert_zero_dimensional('the first element of a tuple in func, representing the start point', t0)
-        _assert_zero_dimensional('the second element of a tuple in func, representing the end point', t1)
+        t0 = _convert_to_tensor(t0, device=t.device)
+        t1 = _convert_to_tensor(t1, device=t.device)
+        _assert_zero_dimensional('t0', t0)
+        _assert_zero_dimensional('t1', t1)
         _check_floating_point('t0', t0)
         _check_floating_point('t1', t1)
         _check_func_type(func_, adjoint)
@@ -267,9 +265,6 @@ def _check_inputs(func, y0, t, adjoint):
         for func_list in func:
             _, _, func_ = func_list
             func_list[2] = _TupleFunc(func_)
-    assert isinstance(y0, tuple), 'y0 must be either a torch.Tensor or a tuple'
-    for y0_ in y0:
-        assert torch.is_tensor(y0_), 'each element must be a torch.Tensor but received {}'.format(type(y0_))
 
     # Normalise to increasing t
     if _decreasing(t):
@@ -291,11 +286,8 @@ def _check_inputs(func, y0, t, adjoint):
             assert t0 < t1, "regions of integration must be monotone and of positive size"
         prev_t1 = t1
 
-    # Check dtypes
-    for y0_ in y0:
-        _check_floating_point('y0', y0_)
-    _check_floating_point('t', t)
-
+    # If t is of length 1 then we should just return our input (which the rest of the odeint machinery doesn't handle,
+    # so we do it here)
     if len(t) == 1:
         solution = tuple(_clone_contiguous(y0_).unsqueeze(0) for y0_ in y0)
         if tensor_input:
