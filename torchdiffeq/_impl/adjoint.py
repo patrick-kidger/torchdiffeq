@@ -5,10 +5,12 @@ from .misc import _check_inputs
 
 
 class _AugmentedDynamics(nn.Module):
-    def __init__(self, base_func, n_tensors, params):
+    def __init__(self, base_func, n_tensors):
         super(_AugmentedDynamics, self).__init__()
         self.base_func = base_func
         self.n_tensors = n_tensors
+
+    def set_params(self, params):
         self.params = params
 
     def forward(self, t, y_aug):
@@ -42,20 +44,77 @@ class _AugmentedDynamics(nn.Module):
         return (*func_eval, *vjp_y, vjp_t, *vjp_params)
 
 
+def _make_adjoint_funcs(t, func, params, n_tensors):
+    # We have `func`, which is a list of 3-element lists of the form [[t0, t1, func1], [t1, t2, func2], ...].
+    # In the adjoint backwards we have separate odeint calls between each set of times t[i - 1], t[i]; we need to create
+    # the appropriate list-of-3-element-lists for each interval.
+    adjoint_funcs = []
+    i = len(t) - 1
+    t0_ = t[-1]
+    func_iter = reversed(func)
+    t0, t1, func_ = next(func_iter)
+    while True:
+        assert t1 == t0_, "internal error"
+        t0_ = max(t0, t[i - 1])
+
+        if t1 == t[i]:
+            adjoint_funcs.append([])
+
+        adjoint_funcs[-1].append([t1, t0_, _AugmentedDynamics(func_, n_tensors)])
+
+        if t0 >= t[i - 1]:
+            try:
+                t0, t1, func_ = next(func_iter)
+            except StopIteration:
+                assert t0 == t[0], "internal error"
+                break
+        else:
+            t1 = t[i - 1]
+        if t0 <= t[i - 1]:
+            i -= 1
+    assert i == 1, "internal error"
+    assert len(adjoint_funcs) == len(t) - 1, "internal error"
+    adjoint_funcs = list(reversed(adjoint_funcs))
+
+    # In each t[i - 1], t[i] interval, we may have different vector fields, and thus different parameters. We _could_
+    # just have every vector field wrt the full collection of all parameters, but that would be very inefficient if
+    # we have a lot of different vector fields. So here, we figure out which parameters are needed in each interval.
+    param_indices = {}
+    for i, param in enumerate(params):
+        param_indices[param] = i
+
+    parameter_indices = []
+    for adjoint_func in adjoint_funcs:
+        parameter_indices.append([])
+        region_funcs = nn.ModuleList(func_ for _, _, func_ in adjoint_func)
+        for param in region_funcs.parameters():
+            parameter_indices[-1].append(param_indices[param])
+        for buffer in region_funcs.buffers():
+            if buffer.requires_grad:
+                parameter_indices[-1].append(param_indices[buffer])
+
+    for adjoint_func, parameter_index in zip(adjoint_funcs, parameter_indices):
+        for _, _, func_ in adjoint_func:
+            func_.set_params(tuple(params[index] for index in parameter_index))
+
+    return adjoint_funcs, parameter_indices
+
+
 class _OdeintAdjointMethod(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, func, t, rtol, atol, method, options, adjoint_rtol, adjoint_atol, adjoint_method,
-                adjoint_options, n_tensors, *args):
+                adjoint_options, adjoint_funcs, parameter_indices, n_tensors, *args):
 
         params = args[:-n_tensors]
         y0 = args[-n_tensors:]
 
-        ctx.func = func
         ctx.adjoint_rtol = adjoint_rtol
         ctx.adjoint_atol = adjoint_atol
         ctx.adjoint_method = adjoint_method
         ctx.adjoint_options = adjoint_options
+        ctx.adjoint_funcs = adjoint_funcs
+        ctx.parameter_indices = parameter_indices
         ctx.n_tensors = n_tensors
 
         with torch.no_grad():
@@ -71,42 +130,10 @@ class _OdeintAdjointMethod(torch.autograd.Function):
 
         # TODO: call odeint_adjoint to implement higher order derivatives.
 
+        T = ans[0].shape[0]
         with torch.no_grad():
-            T = ans[0].shape[0]
-
-            assert T == len(t), "internal error"
-            adjoint_funcs = []
-            i = T - 1
-            t0_ = t[-1]
-            func_iter = reversed(ctx.func)
-            t0, t1, func_ = next(func_iter)
-            while True:
-                assert t1 == t0_, "internal error"
-                t0_ = max(t0, t[i - 1])
-
-                if t1 == t[i]:
-                    adjoint_funcs.append([])
-
-                adjoint_funcs[-1].append([t1, t0_, _AugmentedDynamics(func_, ctx.n_tensors, params)])
-
-                if t0 >= t[i - 1]:
-                    try:
-                        t0, t1, func_ = next(func_iter)
-                    except StopIteration:
-                        assert t0 == t[0], "internal error"
-                        break
-                else:
-                    t1 = t[i - 1]
-                if t0 <= t[i - 1]:
-                    i -= 1
-            assert i == 1, "internal error"
-            assert len(adjoint_funcs) == T - 1, "internal error"
-            adjoint_funcs = list(reversed(adjoint_funcs))
-
-            # TODO: split up params by region
-
             adj_y = tuple(grad_output_[-1] for grad_output_ in grad_output)
-            adj_params = tuple(torch.zeros_like(param) for param in params)
+            adj_params = [torch.zeros_like(param) for param in params]
             adj_time = torch.tensor(0.).to(t)
             time_vjps = []
             for i in range(T - 1, 0, -1):
@@ -117,8 +144,8 @@ class _OdeintAdjointMethod(torch.autograd.Function):
                 # index by 0 to get the first region of integration for this time interval, which aligns with t[i].
                 # index by 2 to get the _AugmentedDynamics out of the tuple (t0, t1, func_).
                 # base_func attribute to get the underlying callable
-                func_i = adjoint_funcs[i - 1][0][2].base_func(t[i], ans_i)
-                assert adjoint_funcs[i - 1][0][0] == t[i], "internal error"
+                func_i = ctx.adjoint_funcs[i - 1][0][2].base_func(t[i], ans_i)
+                assert ctx.adjoint_funcs[i - 1][0][0] == t[i], "internal error"
 
                 # Compute the effect of moving the current time measurement point.
                 dLd_cur_t = sum(
@@ -129,9 +156,9 @@ class _OdeintAdjointMethod(torch.autograd.Function):
                 time_vjps.append(dLd_cur_t)
 
                 # Run the augmented system backwards in time.
-                aug_y0 = (*ans_i, *adj_y, adj_time, *adj_params)
+                aug_y0 = (*ans_i, *adj_y, adj_time) + tuple(adj_params[index] for index in ctx.parameter_indices[i - 1])
                 aug_ans = odeint(
-                    adjoint_funcs[i - 1], aug_y0,
+                    ctx.adjoint_funcs[i - 1], aug_y0,
                     torch.tensor([t[i], t[i - 1]]),
                     rtol=ctx.adjoint_rtol, atol=ctx.adjoint_atol, method=ctx.adjoint_method, options=ctx.adjoint_options
                 )
@@ -139,11 +166,24 @@ class _OdeintAdjointMethod(torch.autograd.Function):
                 # Unpack aug_ans.
                 adj_y = aug_ans[ctx.n_tensors:2 * ctx.n_tensors]
                 adj_time = aug_ans[2 * ctx.n_tensors]
-                adj_params = aug_ans[2 * ctx.n_tensors + 1:]
+                adj_params_region = aug_ans[2 * ctx.n_tensors + 1:]
+
+                for adj_y_ in adj_y:
+                    if len(adj_y_) == 0:
+                        print("hi")
+                if len(adj_time) == 0:
+                    print("adsf")
+                for adj_param_ in adj_params_region:
+                    if len(adj_param_) == 0:
+                        print("jk")
 
                 adj_y = tuple(adj_y_[1] if len(adj_y_) > 0 else adj_y_ for adj_y_ in adj_y)
                 if len(adj_time) > 0: adj_time = adj_time[1]
-                adj_params = tuple(adj_param_[1] if len(adj_param_) > 0 else adj_param_ for adj_param_ in adj_params)
+                adj_params_region = tuple(adj_param_[1] if len(adj_param_) > 0 else adj_param_
+                                          for adj_param_ in adj_params_region)
+
+                for index, adj_param_ in zip(ctx.parameter_indices[i - 1], adj_params_region):
+                    adj_params[index] = adj_param_
 
                 adj_y = tuple(adj_y_ + grad_output_[i - 1] for adj_y_, grad_output_ in zip(adj_y, grad_output))
 
@@ -152,7 +192,8 @@ class _OdeintAdjointMethod(torch.autograd.Function):
             time_vjps.append(adj_time)
             time_vjps = torch.cat(time_vjps[::-1])
 
-            return (None, time_vjps, None, None, None, None, None, None, None, None, None, *adj_params, *adj_y)
+            return (None, time_vjps, None, None, None, None, None, None, None, None, None, None, None, *adj_params,
+                    *adj_y)
 
 
 def odeint_adjoint(func, y0, t, rtol=1e-6, atol=1e-12, method=None, options=None, adjoint_rtol=None, adjoint_atol=None,
@@ -177,8 +218,14 @@ def odeint_adjoint(func, y0, t, rtol=1e-6, atol=1e-12, method=None, options=None
     params = tuple(all_funcs.parameters()) + tuple(buffer for buffer in all_funcs.buffers() if buffer.requires_grad)
     n_tensors = len(y0)
 
+    # Has to be called in the forward pass, irritatingly, because `params` gets modified when passed into
+    # _OdeintAdjointMethod (its Parameter status is stripped), so we can't use it for dictionary keys in
+    # _make_adjoint_funcs
+    adjoint_funcs, parameter_indices = _make_adjoint_funcs(t, func, params, n_tensors)
+
     ys = _OdeintAdjointMethod.apply(func, t, rtol, atol, method, options, adjoint_rtol, adjoint_atol,
-                                    adjoint_method, adjoint_options, n_tensors, *params, *y0)
+                                    adjoint_method, adjoint_options, adjoint_funcs, parameter_indices, n_tensors,
+                                    *params, *y0)
 
     if tensor_input:
         ys = ys[0]

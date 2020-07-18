@@ -30,7 +30,7 @@ def _convert_to_tensor(a, dtype=None, device=None):
 
 
 def _is_finite(tensor):
-    return torch.isfinite(tensor).any()
+    return torch.isfinite(tensor).all()
 
 
 def _is_iterable(inputs):
