@@ -274,7 +274,6 @@ def _check_inputs(func, y0, t, adjoint):
             func_list[0] = -t0
             func_list[1] = -t1
             func_list[2] = _ReverseFunc(func_)
-        func = list(reversed(func))
 
     # Check regions of integration
     assert func[0][0] == t[0], "the first region of integration must begin at t[0]"

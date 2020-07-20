@@ -55,30 +55,30 @@ def _make_adjoint_funcs(t, func, params, n_tensors):
     t0, t1, func_ = next(func_iter)
     while True:
         assert t1 == t0_, "internal error"
-        t0_ = max(t0, t[i - 1])
 
         if t1 == t[i]:
             adjoint_funcs.append([])
+            i -= 1
 
+        t0_ = max(t0, t[i])
         adjoint_funcs[-1].append([t1, t0_, _AugmentedDynamics(func_, n_tensors)])
 
-        if t0 >= t[i - 1]:
+        if t0 >= t[i]:
             try:
                 t0, t1, func_ = next(func_iter)
             except StopIteration:
                 assert t0 == t[0], "internal error"
                 break
         else:
-            t1 = t[i - 1]
-        if t0 <= t[i - 1]:
-            i -= 1
-    assert i == 1, "internal error"
+            t1 = t[i]
+    assert i == 0, "internal error"
     assert len(adjoint_funcs) == len(t) - 1, "internal error"
-    adjoint_funcs = list(reversed(adjoint_funcs))
+    adjoint_funcs = adjoint_funcs[::-1]
 
-    # In each t[i - 1], t[i] interval, we may have different vector fields, and thus different parameters. We _could_
-    # just have every vector field wrt the full collection of all parameters, but that would be very inefficient if
-    # we have a lot of different vector fields. So here, we figure out which parameters are needed in each interval.
+    # In each t[i - 1], t[i] interval, we may have different vector fields, and thus potentially different parameters.
+    # We _could_ just have every vector field calculate gradients wrt the full collection of all parameters, but that
+    # would be very inefficient if we have a lot of different vector fields. So here, we figure out which parameters are
+    # needed in each interval.
     param_indices = {}
     for i, param in enumerate(params):
         param_indices[param] = i
@@ -167,15 +167,6 @@ class _OdeintAdjointMethod(torch.autograd.Function):
                 adj_y = aug_ans[ctx.n_tensors:2 * ctx.n_tensors]
                 adj_time = aug_ans[2 * ctx.n_tensors]
                 adj_params_region = aug_ans[2 * ctx.n_tensors + 1:]
-
-                for adj_y_ in adj_y:
-                    if len(adj_y_) == 0:
-                        print("hi")
-                if len(adj_time) == 0:
-                    print("adsf")
-                for adj_param_ in adj_params_region:
-                    if len(adj_param_) == 0:
-                        print("jk")
 
                 adj_y = tuple(adj_y_[1] if len(adj_y_) > 0 else adj_y_ for adj_y_ in adj_y)
                 if len(adj_time) > 0: adj_time = adj_time[1]
